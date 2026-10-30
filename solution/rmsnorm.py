@@ -1,5 +1,3 @@
-"""Улучшенный Triton-кернел для RMSNorm с полной нагрузкой."""
-
 import torch
 import triton
 import triton.language as tl

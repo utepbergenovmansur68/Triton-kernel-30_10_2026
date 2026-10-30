@@ -58,6 +58,6 @@ def test_rmsnorm_matches_pytorch(dtype, shape):
     torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
     torch.testing.assert_close(x.grad.float(), ref_dx, rtol=tol, atol=tol)
     
-    # Для float16 градиенты весов на T4 из-за порядка суммирования могут иметь шум, проверяем их строго на float32
+    # Проверяем градиент весов только если это float32, для float16 пропускаем из-за специфики аппаратного суммирования на T4
     if dtype == torch.float32:
         torch.testing.assert_close(w.grad.float(), ref_dw, rtol=tol, atol=tol)

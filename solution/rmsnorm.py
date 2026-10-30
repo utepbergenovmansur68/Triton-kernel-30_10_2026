@@ -1,72 +1,58 @@
-"""Собственный слитый Triton-кернел для Qwen2RMSNorm (forward + backward)."""
+"""Исправленный и стабильный Triton-кернел для Qwen2RMSNorm (forward + backward)."""
 
 import torch
-
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # pragma: no cover - optional dependency for CUDA kernels
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 
-if triton is not None:
-    @triton.jit
-    def rmsnorm_fwd_kernel(
-        x_ptr, w_ptr, out_ptr, rstd_ptr,
-        stride_x_row, stride_out_row,
-        n_cols, eps,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        row_idx = tl.program_id(0)
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
+@triton.jit
+def rmsnorm_fwd_kernel(
+    x_ptr, w_ptr, out_ptr, rstd_ptr,
+    stride_x_row, stride_out_row,
+    n_cols, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
 
-        x_row_ptr = x_ptr + row_idx * stride_x_row
-        out_row_ptr = out_ptr + row_idx * stride_out_row
+    x_row_ptr = x_ptr + row_idx * stride_x_row
+    out_row_ptr = out_ptr + row_idx * stride_out_row
 
-        # Загружаем строку и считаем норму в fp32 прямо в быстрой памяти ядра
-        x = tl.load(x_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
 
-        var = tl.sum(x * x, axis=0) / n_cols
-        rstd = tl.rsqrt(var + eps)
+    var = tl.sum(x * x, axis=0) / n_cols
+    rstd = tl.rsqrt(var + eps)
+    tl.store(rstd_ptr + row_idx, rstd)
 
-        # Сохраняем обратное стандартное отклонение для быстрого backward-прохода
-        tl.store(rstd_ptr + row_idx, rstd)
-
-        out = (x * rstd).to(out_ptr.dtype.element_ty).to(tl.float32) * w
-        tl.store(out_row_ptr + col_offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
+    normalized = x * rstd
+    out = normalized * w
+    tl.store(out_row_ptr + col_offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-    @triton.jit
-    def rmsnorm_bwd_kernel(
-        grad_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr,
-        stride_row, n_cols,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        row_idx = tl.program_id(0)
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
+@triton.jit
+def rmsnorm_bwd_kernel(
+    grad_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr,
+    stride_row, n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
 
-        offset = row_idx * stride_row + col_offsets
-        grad = tl.load(grad_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        rstd = tl.load(rstd_ptr + row_idx).to(tl.float32)
+    offset = row_idx * stride_row + col_offsets
+    grad = tl.load(grad_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    rstd = tl.load(rstd_ptr + row_idx).to(tl.float32)
 
-        x_hat = x * rstd
-        m = grad * w
-        c = tl.sum(m * x_hat, axis=0) / n_cols
-        dx = rstd * (m - x_hat * c)
+    norm = x * rstd
+    d_norm = grad * w
+    sum_dnorm_norm = tl.sum(d_norm * norm, axis=0)
+    dx = rstd * (d_norm - norm * sum_dnorm_norm / n_cols)
 
-        tl.store(dx_ptr + offset, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-else:
-    def rmsnorm_fwd_kernel(*args, **kwargs):
-        raise ImportError("Triton is required to run fused RMSNorm kernels.")
-
-    def rmsnorm_bwd_kernel(*args, **kwargs):
-        raise ImportError("Triton is required to run fused RMSNorm kernels.")
+    tl.store(dx_ptr + offset, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
 class FusedRMSNorm(torch.autograd.Function):
@@ -110,8 +96,8 @@ class FusedRMSNorm(torch.autograd.Function):
 
         dw = None
         if ctx.needs_input_grad[1]:
-            x_hat = x_2d.float() * rstd.unsqueeze(1)
-            dw = (grad_2d.float() * x_hat).sum(dim=0).to(weight.dtype)
+            norm = x_2d.float() * rstd.unsqueeze(1)
+            dw = (grad_2d.float() * norm).sum(dim=0).to(weight.dtype)
 
         return dx.view(ctx.orig_shape), dw, None
 

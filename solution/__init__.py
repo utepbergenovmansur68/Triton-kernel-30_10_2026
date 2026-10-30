@@ -14,7 +14,9 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 from .swiglu import patch_qwen2_mlp
+from .rmsnorm import patch_qwen2_rmsnorm
 
 
 def apply():
-    patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
+    patch_qwen2_mlp()      # пример от организаторов
+    patch_qwen2_rmsnorm()  # ОБЯЗАТЕЛЬНО включаем наш RMSNorm-кернел!  # the example: works out of the box, does not count as your own kernel

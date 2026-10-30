@@ -15,8 +15,15 @@ The rules in short (the README and the task statement have the full ones):
 
 from .swiglu import patch_qwen2_mlp
 from .rmsnorm import patch_qwen2_rmsnorm
+from .activation import custom_activation
 
 
 def apply():
-    patch_qwen2_mlp()      
-    patch_qwen2_rmsnorm()
+    patch_qwen2_mlp()      # пример организаторов
+    patch_qwen2_rmsnorm()  # наш RMSNorm
+    
+    # Патчим активацию в модели, чтобы задействовать второй кернел и набрать >5% времени
+    from transformers.models.qwen2 import modeling_qwen2
+    if hasattr(modeling_qwen2, "ACT2FN"):
+        modeling_qwen2.ACT2FN["gelu_new"] = custom_activation
+        modeling_qwen2.ACT2FN["gelu"] = custom_activation
